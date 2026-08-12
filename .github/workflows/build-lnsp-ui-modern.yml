@@ -1,0 +1,154 @@
+name: Build LNSP Pilotage Windows UI modernisee
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'lnsp_pilotage/**'
+      - '.github/workflows/build-lnsp-ui-modern.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Reconstruct and verify validated source
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem 'lnsp_pilotage/chunks/*.txt' | Sort-Object Name
+          if ($parts.Count -ne 9) { throw "Expected 9 source chunks, found $($parts.Count)" }
+          $b64 = (($parts | ForEach-Object { Get-Content -Raw $_.FullName }) -join '')
+          [IO.File]::WriteAllBytes('lnsp_source_v3.zip',[Convert]::FromBase64String($b64))
+          $hash = (Get-FileHash 'lnsp_source_v3.zip' -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne 'a52521004f7ac2645c0045d0c04a238b7b4aa9ac72234a4dab3795a4fe671077') { throw "Source hash mismatch: $hash" }
+          New-Item -ItemType Directory -Force -Path 'buildsrc' | Out-Null
+          Expand-Archive -Path 'lnsp_source_v3.zip' -DestinationPath 'buildsrc' -Force
+
+      - name: Apply validated DuckDB compatibility fix
+        shell: pwsh
+        run: |
+          $p='buildsrc/lnsp/analysis.py'
+          $s=Get-Content -Raw $p
+          $s=$s.Replace("MAX(COALESCE(procedure,'')) procedure,", "MAX(COALESCE(`"procedure`",'')) AS `"procedure`",")
+          Set-Content -Path $p -Value $s -Encoding utf8
+
+      - name: Install modern interface
+        shell: pwsh
+        run: |
+          Copy-Item 'lnsp_pilotage/modern/theme.py' 'buildsrc/lnsp/theme.py' -Force
+          python -c "import base64,gzip,pathlib; src=pathlib.Path('lnsp_pilotage/modern/ui.py.gz.b64').read_text(encoding='utf-8'); pathlib.Path('buildsrc/lnsp/ui.py').write_bytes(gzip.decompress(base64.b64decode(src)))"
+          python -m py_compile buildsrc/lnsp/ui.py buildsrc/lnsp/theme.py
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r buildsrc/requirements-build.txt
+
+      - name: Test real DuckDB core
+        shell: pwsh
+        env:
+          PYTHONPATH: buildsrc
+        run: python -m pytest -q buildsrc/tests/test_real_core.py
+
+      - name: Smoke test every modern screen
+        shell: pwsh
+        env:
+          PYTHONPATH: buildsrc
+        run: |
+          @'
+          from pathlib import Path
+          import tempfile
+          from lnsp.database import Database
+          from lnsp.importers import seed_sigobe_json
+          from lnsp.ui import App
+
+          td = Path(tempfile.mkdtemp())
+          db = Database(td / 'ui-modern.duckdb')
+          seed_sigobe_json(db, Path('buildsrc/data/seed_sigobe_v1_3.json'))
+          app = App(db)
+          for name in ['Tableau de bord','Variations','Prévisions','Historique SIGOBE','Contrôles']:
+              app.show_page(name)
+              app.update_idletasks()
+              app.update()
+          app.destroy()
+          db.close()
+          print('Modern UI: all pages instantiated successfully')
+          '@ | Set-Content -Path 'ui_modern_smoke.py' -Encoding utf8
+          python ui_modern_smoke.py
+
+      - name: Build standalone Windows app
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onedir --noupx `
+            --name 'LNSP Pilotage' `
+            --paths 'buildsrc' `
+            --add-data 'buildsrc/data/seed_sigobe_v1_3.json;data' `
+            --collect-all duckdb `
+            --collect-all openpyxl `
+            --collect-all pptx `
+            'buildsrc/app.pyw'
+          @'
+          LNSP PILOTAGE — VERSION 3.1 INTERFACE MODERNISEE
+
+          Lancement : double-cliquez sur « LNSP Pilotage.exe ».
+          Ne déplacez pas l'exécutable seul : conservez le dossier « LNSP Pilotage » complet avec « _internal ».
+
+          Cette version conserve le moteur métier et DuckDB validés de la version 3.0 et modernise l'expérience :
+          - navigation active et plus lisible ;
+          - tableau de bord hiérarchisé ;
+          - cartes KPI plus compactes ;
+          - barres d'actions et filtres réorganisés ;
+          - tableaux plus lisibles avec alternance de lignes ;
+          - prévisions et rapprochements simplifiés ;
+          - contrôles et historique plus clairs ;
+          - raccourcis clavier : F5, Ctrl+I et Ctrl+1 à Ctrl+5.
+          '@ | Set-Content -Path 'dist/LNSP Pilotage/LISEZ-MOI.txt' -Encoding utf8
+
+      - name: Self-test frozen executable
+        shell: pwsh
+        run: |
+          $exe=(Resolve-Path 'dist/LNSP Pilotage/LNSP Pilotage.exe').Path
+          $p=Start-Process -FilePath $exe -ArgumentList '--self-test' -Wait -PassThru
+          Write-Host "Frozen executable exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "Frozen executable self-test failed with code $($p.ExitCode)" }
+
+      - name: GUI launch smoke test
+        shell: pwsh
+        run: |
+          $exe=(Resolve-Path 'dist/LNSP Pilotage/LNSP Pilotage.exe').Path
+          $crash=Join-Path $env:LOCALAPPDATA 'LNSP_Pilotage/logs/crash.log'
+          if (Test-Path $crash) { Remove-Item $crash -Force }
+          $p=Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 7
+          if ($p.HasExited) {
+            if (Test-Path $crash) { Get-Content $crash -Raw | Write-Host }
+            throw "GUI executable exited during launch smoke test with code $($p.ExitCode)"
+          }
+          if (Test-Path $crash) {
+            Get-Content $crash -Raw | Write-Host
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            throw 'GUI wrote a crash log during launch smoke test'
+          }
+          Write-Host "Modern GUI stayed alive for 7 seconds: PID $($p.Id)"
+          Stop-Process -Id $p.Id -Force
+
+      - name: Package tested application
+        shell: pwsh
+        run: Compress-Archive -Path 'dist/LNSP Pilotage' -DestinationPath 'LNSP_Pilotage_Windows_3_1_Interface_Modernisee.zip' -CompressionLevel Optimal
+
+      - name: Upload tested Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LNSP_Pilotage_Windows_3_1_Interface_Modernisee
+          path: LNSP_Pilotage_Windows_3_1_Interface_Modernisee.zip
+          if-no-files-found: error
+          retention-days: 14
