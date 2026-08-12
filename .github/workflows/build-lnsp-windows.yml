@@ -1,0 +1,83 @@
+name: Build LNSP Pilotage Windows
+
+on:
+  push:
+    branches:
+      - lnsp-pilotage-windows-build
+    paths:
+      - 'lnsp_pilotage/**'
+      - '.github/workflows/build-lnsp-windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Decode source
+        shell: pwsh
+        run: |
+          $b64 = Get-Content -Raw 'lnsp_pilotage/source_v3.zip.b64'
+          [IO.File]::WriteAllBytes('lnsp_source_v3.zip',[Convert]::FromBase64String($b64))
+          New-Item -ItemType Directory -Force -Path 'buildsrc' | Out-Null
+          Expand-Archive -Path 'lnsp_source_v3.zip' -DestinationPath 'buildsrc' -Force
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r buildsrc/requirements-build.txt
+
+      - name: Run real DuckDB tests
+        shell: pwsh
+        env:
+          PYTHONPATH: buildsrc
+        run: |
+          python -m pytest -q buildsrc/tests/test_real_core.py
+
+      - name: Build standalone Windows application
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onedir --noupx `
+            --name 'LNSP Pilotage' `
+            --paths 'buildsrc' `
+            --add-data 'buildsrc/data/seed_sigobe_v1_3.json;data' `
+            --collect-all duckdb `
+            --collect-all openpyxl `
+            --collect-all pptx `
+            'buildsrc/app.pyw'
+
+      - name: Add user guide
+        shell: pwsh
+        run: |
+          Copy-Item 'buildsrc/README_WINDOWS.txt' 'dist/LNSP Pilotage/LISEZ-MOI.txt' -Force
+
+      - name: Self-test the frozen executable
+        shell: pwsh
+        run: |
+          & 'dist/LNSP Pilotage/LNSP Pilotage.exe' --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Frozen executable self-test failed with code $LASTEXITCODE" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path 'dist/LNSP Pilotage' -DestinationPath 'LNSP_Pilotage_Windows_3_0.zip' -CompressionLevel Optimal
+
+      - name: Upload tested Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LNSP_Pilotage_Windows_3_0
+          path: LNSP_Pilotage_Windows_3_0.zip
+          if-no-files-found: error
+          retention-days: 14
