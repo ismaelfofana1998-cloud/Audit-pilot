@@ -1,0 +1,97 @@
+name: Build LNSP Pilotage Windows FINAL
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'lnsp_pilotage/**'
+      - '.github/workflows/build-lnsp-pr6.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reconstruct and verify source
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem 'lnsp_pilotage/chunks/*.txt' | Sort-Object Name
+          if ($parts.Count -ne 9) { throw "Expected 9 source chunks, found $($parts.Count)" }
+          $b64 = (($parts | ForEach-Object { Get-Content -Raw $_.FullName }) -join '')
+          [IO.File]::WriteAllBytes('lnsp_source_v3.zip',[Convert]::FromBase64String($b64))
+          $hash = (Get-FileHash 'lnsp_source_v3.zip' -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne 'a52521004f7ac2645c0045d0c04a238b7b4aa9ac72234a4dab3795a4fe671077') { throw "Source hash mismatch: $hash" }
+          New-Item -ItemType Directory -Force -Path 'buildsrc' | Out-Null
+          Expand-Archive -Path 'lnsp_source_v3.zip' -DestinationPath 'buildsrc' -Force
+      - name: Apply DuckDB compatibility fix
+        shell: pwsh
+        run: |
+          $p='buildsrc/lnsp/analysis.py'
+          $s=Get-Content -Raw $p
+          $s=$s.Replace("MAX(COALESCE(procedure,'')) procedure,", "MAX(COALESCE(`"procedure`",'')) AS `"procedure`",")
+          Set-Content -Path $p -Value $s -Encoding utf8
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r buildsrc/requirements-build.txt
+      - name: Test real DuckDB core
+        shell: pwsh
+        env:
+          PYTHONPATH: buildsrc
+        run: python -m pytest -q buildsrc/tests/test_real_core.py
+      - name: Build standalone Windows app
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onedir --noupx `
+            --name 'LNSP Pilotage' `
+            --paths 'buildsrc' `
+            --add-data 'buildsrc/data/seed_sigobe_v1_3.json;data' `
+            --collect-all duckdb `
+            --collect-all openpyxl `
+            --collect-all pptx `
+            'buildsrc/app.pyw'
+          Copy-Item 'buildsrc/README_WINDOWS.txt' 'dist/LNSP Pilotage/LISEZ-MOI.txt' -Force
+      - name: Self-test frozen executable
+        shell: pwsh
+        run: |
+          $exe=(Resolve-Path 'dist/LNSP Pilotage/LNSP Pilotage.exe').Path
+          $p=Start-Process -FilePath $exe -ArgumentList '--self-test' -Wait -PassThru
+          Write-Host "Frozen executable exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "Frozen executable self-test failed with code $($p.ExitCode)" }
+      - name: GUI launch smoke test
+        shell: pwsh
+        run: |
+          $exe=(Resolve-Path 'dist/LNSP Pilotage/LNSP Pilotage.exe').Path
+          $crash=Join-Path $env:LOCALAPPDATA 'LNSP_Pilotage/logs/crash.log'
+          if (Test-Path $crash) { Remove-Item $crash -Force }
+          $p=Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 7
+          if ($p.HasExited) {
+            if (Test-Path $crash) { Get-Content $crash -Raw | Write-Host }
+            throw "GUI executable exited during launch smoke test with code $($p.ExitCode)"
+          }
+          if (Test-Path $crash) {
+            Get-Content $crash -Raw | Write-Host
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            throw 'GUI wrote a crash log during launch smoke test'
+          }
+          Write-Host "GUI stayed alive for 7 seconds: PID $($p.Id)"
+          Stop-Process -Id $p.Id -Force
+      - name: Package tested application
+        shell: pwsh
+        run: Compress-Archive -Path 'dist/LNSP Pilotage' -DestinationPath 'LNSP_Pilotage_Windows_3_0_FINAL.zip' -CompressionLevel Optimal
+      - name: Upload tested Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LNSP_Pilotage_Windows_3_0_FINAL
+          path: LNSP_Pilotage_Windows_3_0_FINAL.zip
+          if-no-files-found: error
+          retention-days: 14
